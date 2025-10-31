@@ -23,6 +23,7 @@ import (
 	corestats "github.com/xtls/xray-core/features/stats"
 	coreserial "github.com/xtls/xray-core/infra/conf/serial"
 	_ "github.com/xtls/xray-core/main/distro/all"
+	v2internet "github.com/xtls/xray-core/transport/internet"
 	mobasset "golang.org/x/mobile/asset"
 )
 
@@ -36,14 +37,18 @@ const (
 // CoreController represents a controller for managing Xray core instance lifecycle
 type CoreController struct {
 	CallbackHandler CoreCallbackHandler
+	dialer          *ProtectedDialer
 	statsManager    corestats.Manager
 	coreMutex       sync.Mutex
 	coreInstance    *core.Instance
 	IsRunning       bool
+	DomainName      string
+	closeChan       chan struct{}
 }
 
 // CoreCallbackHandler defines interface for receiving callbacks and notifications from the core service
 type CoreCallbackHandler interface {
+	Protect(int) bool
 	Startup() int
 	Shutdown() int
 	OnEmitStatus(int, string) int
@@ -100,8 +105,12 @@ func NewCoreController(s CoreCallbackHandler) *CoreController {
 		log.Printf("Failed to register log handler: %v", err)
 	}
 
+	dialer := NewProtectedDialer(s)
+	v2internet.UseAlternativeSystemDialer(dialer)
+
 	return &CoreController{
 		CallbackHandler: s,
+		dialer:          dialer,
 	}
 }
 
@@ -117,6 +126,29 @@ func (x *CoreController) StartLoop(configContent string) (err error) {
 		return nil
 	}
 
+	x.closeChan = make(chan struct{})
+	x.dialer.PrepareResolveChan()
+	go func() {
+		select {
+		// wait until resolved
+		case <-x.dialer.ResolveChan():
+			// shutdown VPNService if server name can not reolved
+			if !x.dialer.IsVServerReady() {
+				log.Println("vServer cannot resolved, shutdown")
+				x.StopLoop()
+				x.CallbackHandler.Shutdown()
+			}
+
+		// stop waiting if manually closed
+		case <-x.closeChan:
+		}
+	}()
+
+	go func() {
+		x.dialer.PrepareDomain(x.DomainName, x.closeChan)
+		close(x.dialer.ResolveChan())
+	}()
+
 	return x.doStartLoop(configContent)
 }
 
@@ -127,6 +159,7 @@ func (x *CoreController) StopLoop() error {
 	defer x.coreMutex.Unlock()
 
 	if x.IsRunning {
+		close(x.closeChan)
 		x.doShutdown()
 		x.CallbackHandler.OnEmitStatus(0, "Core stopped")
 	}
@@ -153,6 +186,15 @@ func (x *CoreController) QueryStats(tag string, direct string) int64 {
 func (x *CoreController) MeasureDelay(url string) (int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
+
+	go func() {
+		select {
+		case <-x.closeChan:
+			// cancel request if close called during meansure
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
 	return measureInstDelay(ctx, x.coreInstance, url)
 }
